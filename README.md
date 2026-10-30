@@ -35,7 +35,7 @@ automatically moves backwards to reduce the risk of a collision.
 -   [Possible Improvements](#possible-improvements)
 -   [Troubleshooting](#troubleshooting)
 -   [Contributing](#contributing)
--   [License](#license)
+
 
 ## Overview
 
