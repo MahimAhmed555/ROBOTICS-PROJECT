@@ -3,8 +3,6 @@
                                     
 # Members: Safwan Al Muktadir and Mostafiz Mahim Ahmed
                                 
-# Project: Web-Controlled Obstacle-Avoiding Car
-
 
 # Web-Controlled Obstacle-Avoiding Car
 
