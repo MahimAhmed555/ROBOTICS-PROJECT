@@ -1,0 +1,391 @@
+/*
+  ---------------------------------------------------------
+  Project         : ESP32 WiFi 4WD Car with 4-Wheel Steering + Dual HC-SR04 & Buzzer
+  Board Target    : Standard ESP32 Dev Board (WROOM-32)
+  Wi-Fi AP        : MrPotato2425 / Password: 7772425
+  ---------------------------------------------------------
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+// =====================================================================
+// 1. MOTOR PIN DEFINITIONS
+// =====================================================================
+const int RIGHT_MOTOR_EN  = 23;  // ENA
+const int RIGHT_MOTOR_IN1 = 22;  // IN1
+const int RIGHT_MOTOR_IN2 = 21;  // IN2
+
+const int LEFT_MOTOR_EN  = 16;   // ENB
+const int LEFT_MOTOR_IN1 = 17;   // IN3
+const int LEFT_MOTOR_IN2 = 5;    // IN4
+
+// =====================================================================
+// 2. SERVO PIN DEFINITIONS
+// =====================================================================
+const int FRONT_SERVO_PIN = 14;
+const int REAR_SERVO_PIN  = 27;
+
+// =====================================================================
+// 3. ULTRASONIC SENSOR & BUZZER PIN DEFINITIONS
+// =====================================================================
+const int FRONT_TRIG_PIN = 32;
+const int FRONT_ECHO_PIN = 33; 
+
+const int BACK_TRIG_PIN  = 25;
+const int BACK_ECHO_PIN  = 26; 
+
+const int BUZZER_PIN     = 4;
+
+// Obstacle threshold: 7.5 inches = ~19.05 cm
+const float OBSTACLE_THRESHOLD_CM = 19.05;
+
+// =====================================================================
+// 4. STEERING ANGLE SETTINGS
+// =====================================================================
+const int FRONT_LEFT   = 65;
+const int FRONT_CENTER = 95;
+const int FRONT_RIGHT  = 125;
+
+const int REAR_LEFT   = 100;
+const int REAR_CENTER = 80;
+const int REAR_RIGHT  = 50;
+
+// =====================================================================
+// 5. PWM SETTINGS
+// =====================================================================
+const int MOTOR_PWM_FREQUENCY  = 15000;
+const int MOTOR_PWM_RESOLUTION = 8;
+const int MOTOR_PWM_MAX        = 255;
+
+const int MIN_SPEED_PERCENT     = 0;
+const int MAX_SPEED_PERCENT     = 100;
+const int DEFAULT_SPEED_PERCENT = 50;
+const int MIN_USABLE_MOTOR_PWM_PERCENT = 70;
+
+const unsigned long DRIVE_SAFETY_TIMEOUT_MS = 650;
+
+// =====================================================================
+// 6. DRIVE STATE
+// =====================================================================
+enum DriveCommand {
+  DRIVE_STOPPED,
+  DRIVE_FORWARD,
+  DRIVE_REVERSE,
+  DRIVE_ROTATE_LEFT,
+  DRIVE_ROTATE_RIGHT
+};
+
+DriveCommand currentDriveCommand = DRIVE_STOPPED;
+int motorSpeedPercent = DEFAULT_SPEED_PERCENT;
+int motorPwmValue = 0;
+unsigned long lastDriveCommandTime = 0;
+
+int currentFrontAngle = FRONT_CENTER;
+int currentRearAngle  = REAR_CENTER;
+
+// =====================================================================
+// 7. WI-FI SETTINGS
+// =====================================================================
+const char* AP_SSID     = "MrPotato2425";
+const char* AP_PASSWORD = "7772425";
+
+WebServer server(80);
+
+// =====================================================================
+// 8. WEB REMOTE INTERFACE (HTML)
+// =====================================================================
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>MrPotato2425 4WD Car</title>
+  <style>
+    :root {
+      --background: #0f172a; --panel: #1e293b; --panel-dark: #111827;
+      --border: #334155; --text: #f8fafc; --muted: #94a3b8;
+      --blue: #2563eb; --red: #dc2626; --green: #22c55e; --lost: #f87171;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body { margin: 0; min-height: 100vh; padding: 10px; background: var(--background); color: var(--text); font-family: Arial, sans-serif; }
+    .remote { width: 100%; max-width: 760px; margin: 0 auto; }
+    .top-panel, .mode-panel, .control-panel, .speed-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 18px; margin-top: 9px; padding: 10px; }
+    .brand { margin: 0; text-align: center; font-size: 23px; font-weight: 700; }
+    .subtitle { margin: 4px 0 0; text-align: center; color: var(--muted); font-size: 12px; }
+    .status-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin-top: 11px; }
+    .status-box { padding: 8px 5px; background: var(--panel-dark); border: 1px solid var(--border); border-radius: 12px; text-align: center; }
+    .status-label { margin-bottom: 4px; color: var(--muted); font-size: 10px; }
+    .status-value { font-size: 12px; font-weight: 700; }
+    .connected { color: var(--green); }
+    .disconnected { color: var(--lost); }
+    .mode-buttons { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+    .mode-button, .emergency-button, .drive-button, .drive-stop-button, .steering-button {
+      background: var(--panel-dark); border: 1px solid var(--border); border-radius: 12px; color: var(--text); font-weight: 700; cursor: pointer;
+    }
+    .mode-button { min-height: 45px; font-size: 12px; }
+    .mode-button.active, .drive-button.active, .steering-button.active { background: var(--blue); border-color: var(--blue); }
+    .emergency-button { background: var(--red); border-color: var(--red); font-size: 12px; padding: 6px; }
+    .control-panel { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+    .control-title { margin: 0; text-align: center; font-size: 15px; }
+    .drive-pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+    .drive-button, .drive-stop-button { min-height: 70px; padding: 5px; }
+    .drive-stop-button { background: var(--red); border-color: var(--red); }
+    .button-icon { display: block; font-size: 23px; }
+    .button-label { display: block; font-size: 9px; }
+    .steering-pad { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+    .steering-button { min-height: 210px; font-size: 15px; }
+    .speed-slider { width: 100%; }
+  </style>
+</head>
+<body>
+  <main class="remote">
+    <section class="top-panel">
+      <h1 class="brand">MrPotato2425 4WD Car</h1>
+      <p class="subtitle">4WD + 4-Wheel Steering Web Remote</p>
+      <div class="status-grid">
+        <div class="status-box"><div class="status-label">Wi-Fi</div><div class="status-value connected" id="connectionStatus">Connected</div></div>
+        <div class="status-box"><div class="status-label">Drive</div><div class="status-value" id="driveStatus">STOP</div></div>
+        <div class="status-box"><div class="status-label">Steering</div><div class="status-value" id="steeringStatus">CENTER</div></div>
+      </div>
+    </section>
+    <section class="mode-panel">
+      <div class="mode-buttons">
+        <button type="button" class="mode-button" data-mode="front">Front</button>
+        <button type="button" class="mode-button" data-mode="rear">Rear</button>
+        <button type="button" class="mode-button active" data-mode="4ws">4WS</button>
+        <button type="button" class="mode-button" data-mode="crab">Crab</button>
+      </div>
+      <button type="button" class="emergency-button" id="emergencyButton" style="width:100%; margin-top:8px;">STOP ALL</button>
+    </section>
+    <section class="control-panel">
+      <div>
+        <h2 class="control-title">Drive</h2>
+        <div class="drive-pad" style="margin-top:8px;">
+          <div></div>
+          <button type="button" class="drive-button" data-drive="forward"><span class="button-icon">&#9650;</span><span class="button-label">Fwd</span></button>
+          <div></div>
+          <button type="button" class="drive-button" data-drive="left"><span class="button-icon">&#8630;</span><span class="button-label">Rot L</span></button>
+          <button type="button" class="drive-stop-button" id="driveStopButton"><span class="button-icon">&#9632;</span><span class="button-label">Stop</span></button>
+          <button type="button" class="drive-button" data-drive="right"><span class="button-icon">&#8631;</span><span class="button-label">Rot R</span></button>
+          <div></div>
+          <button type="button" class="drive-button" data-drive="reverse"><span class="button-icon">&#9660;</span><span class="button-label">Rev</span></button>
+          <div></div>
+        </div>
+      </div>
+      <div>
+        <h2 class="control-title">Steering</h2>
+        <div class="steering-pad" style="margin-top:8px;">
+          <button type="button" class="steering-button" data-steering="left"><span style="font-size:35px;">&#9664;</span><br>Left</button>
+          <button type="button" class="steering-button" data-steering="right"><span style="font-size:35px;">&#9654;</span><br>Right</button>
+        </div>
+      </div>
+    </section>
+    <section class="speed-panel">
+      <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
+        <span>Motor Speed</span><span><span id="speedValue">50</span>%</span>
+      </div>
+      <input id="speedSlider" class="speed-slider" type="range" min="0" max="100" value="50">
+    </section>
+  </main>
+  <script>
+    const connectionStatus = document.getElementById('connectionStatus');
+    const driveStatus = document.getElementById('driveStatus');
+    const steeringStatus = document.getElementById('steeringStatus');
+    const speedSlider = document.getElementById('speedSlider');
+    const speedValue = document.getElementById('speedValue');
+    let lastCommandId = 0;
+    function createCommandId() { return Math.max(++lastCommandId, Date.now() * 1000); }
+    async function sendRequest(url) {
+      try { await fetch(url, { method: 'GET', cache: 'no-store' }); connectionStatus.textContent = 'Connected'; connectionStatus.className = 'status-value connected'; }
+      catch(e) { connectionStatus.textContent = 'Lost'; connectionStatus.className = 'status-value disconnected'; }
+    }
+    document.querySelectorAll('[data-drive]').forEach(btn => {
+      btn.addEventListener('pointerdown', e => { e.preventDefault(); driveStatus.textContent = btn.dataset.drive.toUpperCase(); sendRequest('/drive?cmd=' + btn.dataset.drive + '&id=' + createCommandId()); });
+      btn.addEventListener('pointerup', () => { driveStatus.textContent = 'STOP'; sendRequest('/drive?cmd=stop&id=' + createCommandId()); });
+    });
+    document.querySelectorAll('[data-steering]').forEach(btn => {
+      btn.addEventListener('pointerdown', e => { e.preventDefault(); steeringStatus.textContent = btn.dataset.steering.toUpperCase(); sendRequest('/steer?dir=' + btn.dataset.steering + '&id=' + createCommandId()); });
+      btn.addEventListener('pointerup', () => { steeringStatus.textContent = 'CENTER'; sendRequest('/steer?dir=center&id=' + createCommandId()); });
+    });
+    document.querySelectorAll('[data-mode]').forEach(btn => {
+      btn.addEventListener('click', () => { document.querySelectorAll('[data-mode]').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); sendRequest('/mode?value=' + btn.dataset.mode + '&id=' + createCommandId()); });
+    });
+    document.getElementById('emergencyButton').addEventListener('pointerdown', () => { driveStatus.textContent = 'STOP'; steeringStatus.textContent = 'CENTER'; sendRequest('/emergency?id=' + createCommandId()); });
+    speedSlider.addEventListener('input', () => { speedValue.textContent = speedSlider.value; sendRequest('/speed?value=' + speedSlider.value + '&id=' + createCommandId()); });
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// =====================================================================
+// 9. ULTRASONIC & SENSOR HELPER FUNCTIONS
+// =====================================================================
+long measureDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  if (duration == 0) return 999; 
+  return (duration * 0.034 / 2);
+}
+
+void checkObstaclesAndAlert() {
+  long frontDistCm = measureDistance(FRONT_TRIG_PIN, FRONT_ECHO_PIN);
+  long backDistCm  = measureDistance(BACK_TRIG_PIN, BACK_ECHO_PIN);
+
+  if (frontDistCm <= OBSTACLE_THRESHOLD_CM || backDistCm <= OBSTACLE_THRESHOLD_CM) {
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+// =====================================================================
+// 10. MOTOR & SERVO CONTROL FUNCTIONS
+// =====================================================================
+int speedPercentToPwm(int speedPercent) {
+  speedPercent = constrain(speedPercent, MIN_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  int minimumUsablePwm = (MOTOR_PWM_MAX * MIN_USABLE_MOTOR_PWM_PERCENT) / 100;
+  return map(speedPercent, 0, 100, minimumUsablePwm, MOTOR_PWM_MAX);
+}
+
+void applyDriveMotors(DriveCommand cmd, int pwm) {
+  switch (cmd) {
+    case DRIVE_FORWARD:
+      digitalWrite(RIGHT_MOTOR_IN1, HIGH); digitalWrite(RIGHT_MOTOR_IN2, LOW);
+      digitalWrite(LEFT_MOTOR_IN1, HIGH);  digitalWrite(LEFT_MOTOR_IN2, LOW);
+      ledcWrite(RIGHT_MOTOR_EN, pwm);
+      ledcWrite(LEFT_MOTOR_EN, pwm);
+      break;
+    case DRIVE_REVERSE:
+      digitalWrite(RIGHT_MOTOR_IN1, LOW);  digitalWrite(RIGHT_MOTOR_IN2, HIGH);
+      digitalWrite(LEFT_MOTOR_IN1, LOW);  digitalWrite(LEFT_MOTOR_IN2, HIGH);
+      ledcWrite(RIGHT_MOTOR_EN, pwm);
+      ledcWrite(LEFT_MOTOR_EN, pwm);
+      break;
+    case DRIVE_ROTATE_LEFT:
+      digitalWrite(RIGHT_MOTOR_IN1, HIGH); digitalWrite(RIGHT_MOTOR_IN2, LOW);
+      digitalWrite(LEFT_MOTOR_IN1, LOW);  digitalWrite(LEFT_MOTOR_IN2, HIGH);
+      ledcWrite(RIGHT_MOTOR_EN, pwm);
+      ledcWrite(LEFT_MOTOR_EN, pwm);
+      break;
+    case DRIVE_ROTATE_RIGHT:
+      digitalWrite(RIGHT_MOTOR_IN1, LOW);  digitalWrite(RIGHT_MOTOR_IN2, HIGH);
+      digitalWrite(LEFT_MOTOR_IN1, HIGH);  digitalWrite(LEFT_MOTOR_IN2, LOW);
+      ledcWrite(RIGHT_MOTOR_EN, pwm);
+      ledcWrite(LEFT_MOTOR_EN, pwm);
+      break;
+    case DRIVE_STOPPED:
+    default:
+      digitalWrite(RIGHT_MOTOR_IN1, LOW); digitalWrite(RIGHT_MOTOR_IN2, LOW);
+      digitalWrite(LEFT_MOTOR_IN1, LOW);  digitalWrite(LEFT_MOTOR_IN2, LOW);
+      ledcWrite(RIGHT_MOTOR_EN, 0);
+      ledcWrite(LEFT_MOTOR_EN, 0);
+      break;
+  }
+}
+
+void updateSteeringServos() {
+  int frontDuty = map(currentFrontAngle, 0, 180, 500, 2500);
+  int rearDuty  = map(currentRearAngle, 0, 180, 500, 2500);
+  
+  int frontDutyCycle = map(frontDuty, 0, 20000, 0, 65535);
+  int rearDutyCycle  = map(rearDuty, 0, 20000, 0, 65535);
+
+  ledcWrite(FRONT_SERVO_PIN, frontDutyCycle);
+  ledcWrite(REAR_SERVO_PIN, rearDutyCycle);
+}
+
+// =====================================================================
+// 11. SETUP & LOOP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RIGHT_MOTOR_IN1, OUTPUT);
+  pinMode(RIGHT_MOTOR_IN2, OUTPUT);
+  pinMode(LEFT_MOTOR_IN1, OUTPUT);
+  pinMode(LEFT_MOTOR_IN2, OUTPUT);
+
+  pinMode(FRONT_TRIG_PIN, OUTPUT);
+  pinMode(FRONT_ECHO_PIN, INPUT);
+  pinMode(BACK_TRIG_PIN, OUTPUT);
+  pinMode(BACK_ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  ledcAttach(RIGHT_MOTOR_EN, MOTOR_PWM_FREQUENCY, MOTOR_PWM_RESOLUTION);
+  ledcAttach(LEFT_MOTOR_EN, MOTOR_PWM_FREQUENCY, MOTOR_PWM_RESOLUTION);
+
+  ledcAttach(FRONT_SERVO_PIN, 50, 16);
+  ledcAttach(REAR_SERVO_PIN, 50, 16);
+
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html", INDEX_HTML);
+  });
+
+  server.on("/drive", HTTP_GET, []() {
+    String cmd = server.arg("cmd");
+    if (cmd == "forward") currentDriveCommand = DRIVE_FORWARD;
+    else if (cmd == "reverse") currentDriveCommand = DRIVE_REVERSE;
+    else if (cmd == "left") currentDriveCommand = DRIVE_ROTATE_LEFT;
+    else if (cmd == "right") currentDriveCommand = DRIVE_ROTATE_RIGHT;
+    else currentDriveCommand = DRIVE_STOPPED;
+
+    motorPwmValue = speedPercentToPwm(motorSpeedPercent);
+    applyDriveMotors(currentDriveCommand, motorPwmValue);
+    lastDriveCommandTime = millis();
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/steer", HTTP_GET, []() {
+    String dir = server.arg("dir");
+    if (dir == "left") {
+      currentFrontAngle = FRONT_LEFT;
+      currentRearAngle = REAR_RIGHT;
+    } else if (dir == "right") {
+      currentFrontAngle = FRONT_RIGHT;
+      currentRearAngle = REAR_LEFT;
+    } else {
+      currentFrontAngle = FRONT_CENTER;
+      currentRearAngle = REAR_CENTER;
+    }
+    updateSteeringServos();
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/speed", HTTP_GET, []() {
+    motorSpeedPercent = server.arg("value").toInt();
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/emergency", HTTP_GET, []() {
+    currentDriveCommand = DRIVE_STOPPED;
+    applyDriveMotors(DRIVE_STOPPED, 0);
+    currentFrontAngle = FRONT_CENTER;
+    currentRearAngle = REAR_CENTER;
+    updateSteeringServos();
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  if (millis() - lastDriveCommandTime > DRIVE_SAFETY_TIMEOUT_MS) {
+    currentDriveCommand = DRIVE_STOPPED;
+    applyDriveMotors(DRIVE_STOPPED, 0);
+  }
+
+  checkObstaclesAndAlert();
+}
